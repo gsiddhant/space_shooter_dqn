@@ -18,7 +18,25 @@
 from __future__ import division
 import pygame
 import random
+import numpy as np
+import skimage
+from skimage.color import rgb2gray
+from skimage.transform import resize
+from skimage.exposure import rescale_intensity
 from os import path
+
+import json
+from collections import deque
+from keras import initializers as initializations
+from keras.initializers import normal, identity
+from keras.models import model_from_json
+from keras.models import Sequential
+from keras.layers.core import Dense, Dropout, Activation, Flatten
+from keras.layers.convolutional import Convolution2D, MaxPooling2D
+from keras.optimizers import SGD, Adam, Adagrad
+import tensorflow as tf
+
+from pykeyboard import PyKeyboard
 
 ## assets folder
 img_dir = path.join(path.dirname(__file__), 'assets')
@@ -33,7 +51,7 @@ POWERUP_TIME = 5000
 BAR_LENGTH = 100
 BAR_HEIGHT = 10
 
-# Define Colors 
+# Define Colors
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 RED = (255, 0, 0)
@@ -50,9 +68,54 @@ pygame.mixer.init()  ## For sound
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Space Shooter")
 clock = pygame.time.Clock()     ## For syncing the FPS
+score = 0   ## Making the score global
 ###############################
 
 font_name = pygame.font.match_font('arial')
+
+OBSERVATION = 64000
+FINAL_EPSILON = 0.0001
+INITIAL_EPSILON = 0.1
+REPLAY_MEMORY = 50000
+BATCH = 32
+LEARNING_RATE = 1e-4
+CONFIG = 'nothreshold'
+ACTIONS = 5
+EXPLORE = 3000000
+GAMMA = 0.99
+
+img_rows , img_cols = 80, 80
+img_channels = 4
+
+def stack_screens(screen, stack_screen):
+    t_screen = rgb2gray(pygame.surfarray.array3d(screen))
+    t_screen = resize(t_screen,(80,80))
+    t_screen = rescale_intensity(t_screen, out_range=(0, 255))
+    t_screen = t_screen.reshape(1, t_screen.shape[0], t_screen.shape[1], 1) #1x80x80x1
+
+    stack_screen = np.append(t_screen, stack_screen[:, :, :, :3], axis = 3)
+    return stack_screen
+
+def buildmodel():
+    print 'Building CNN Model'
+    model = Sequential()
+    model.add(Convolution2D(32, 8, 8, subsample=(4, 4), border_mode='same',input_shape=(img_rows,img_cols,img_channels)))  #80*80*4
+    model.add(Activation('relu'))
+    model.add(Convolution2D(64, 4, 4, subsample=(2, 2), border_mode='same'))
+    model.add(Activation('relu'))
+    model.add(Convolution2D(64, 3, 3, subsample=(1, 1), border_mode='same'))
+    model.add(Activation('relu'))
+    model.add(Flatten())
+    model.add(Dense(512))
+    model.add(Activation('relu'))
+    model.add(Dense(5))
+
+    adam = Adam(lr=1e-6)
+    model.compile(loss='mse',optimizer=adam)
+    print("We finish building the model")
+    return model
+
+model = buildmodel()
 
 def main_menu():
     global screen
@@ -76,7 +139,7 @@ def main_menu():
                 quit()
         elif ev.type == pygame.QUIT:
                 pygame.quit()
-                quit() 
+                quit()
         else:
             draw_text(screen, "Press [ENTER] To Begin", 30, WIDTH/2, HEIGHT/2)
             draw_text(screen, "or [Q] To Quit", 30, WIDTH/2, (HEIGHT/2)+40)
@@ -88,12 +151,12 @@ def main_menu():
     screen.fill(BLACK)
     draw_text(screen, "GET READY!", 40, WIDTH/2, HEIGHT/2)
     pygame.display.update()
-    
+
 
 def draw_text(surf, text, size, x, y):
     ## selecting a cross platform font to display the score
     font = pygame.font.Font(font_name, size)
-    text_surface = font.render(text, True, WHITE)       ## True denotes the font to be anti-aliased 
+    text_surface = font.render(text, True, WHITE)       ## True denotes the font to be anti-aliased
     text_rect = text_surface.get_rect()
     text_rect.midtop = (x, y)
     surf.blit(text_surface, text_rect)
@@ -102,7 +165,7 @@ def draw_text(surf, text, size, x, y):
 def draw_shield_bar(surf, x, y, pct):
     # if pct < 0:
     #     pct = 0
-    pct = max(pct, 0) 
+    pct = max(pct, 0)
     ## moving them to top
     # BAR_LENGTH = 100
     # BAR_HEIGHT = 10
@@ -134,7 +197,7 @@ class Explosion(pygame.sprite.Sprite):
         self.image = explosion_anim[self.size][0]
         self.rect = self.image.get_rect()
         self.rect.center = center
-        self.frame = 0 
+        self.frame = 0
         self.last_update = pygame.time.get_ticks()
         self.frame_rate = 75
 
@@ -162,7 +225,7 @@ class Player(pygame.sprite.Sprite):
         self.radius = 20
         self.rect.centerx = WIDTH / 2
         self.rect.bottom = HEIGHT - 10
-        self.speedx = 0 
+        self.speedx = 0
         self.shield = 100
         self.shoot_delay = 250
         self.last_shot = pygame.time.get_ticks()
@@ -178,25 +241,27 @@ class Player(pygame.sprite.Sprite):
             self.power -= 1
             self.power_time = pygame.time.get_ticks()
 
-        ## unhide 
+        ## unhide
         if self.hidden and pygame.time.get_ticks() - self.hide_timer > 1000:
             self.hidden = False
             self.rect.centerx = WIDTH / 2
             self.rect.bottom = HEIGHT - 30
 
-        self.speedx = 0     ## makes the player static in the screen by default. 
-        # then we have to check whether there is an event hanlding being done for the arrow keys being 
-        ## pressed 
+        self.speedx = 0     ## makes the player static in the screen by default.
+        # then we have to check whether there is an event hanlding being done for the arrow keys being
+        ## pressed
 
         ## will give back a list of the keys which happen to be pressed down at that moment
-        keystate = pygame.key.get_pressed()     
-        if keystate[pygame.K_LEFT]:
+        keystate = pygame.key.get_pressed()
+        if keystate[pygame.K_a]:
             self.speedx = -5
-        elif keystate[pygame.K_RIGHT]:
+        elif keystate[pygame.K_d]:
             self.speedx = 5
 
         #Fire weapons by holding spacebar
-        if keystate[pygame.K_SPACE]:
+        if keystate[pygame.K_s]:
+            global score
+            score -= 0.01
             self.shoot()
 
         ## check for the borders at the left and right
@@ -263,19 +328,19 @@ class Mob(pygame.sprite.Sprite):
         self.rect.y = random.randrange(-150, -100)
         self.speedy = random.randrange(5, 20)        ## for randomizing the speed of the Mob
 
-        ## randomize the movements a little more 
+        ## randomize the movements a little more
         self.speedx = random.randrange(-3, 3)
 
         ## adding rotation to the mob element
         self.rotation = 0
         self.rotation_speed = random.randrange(-8, 8)
         self.last_update = pygame.time.get_ticks()  ## time when the rotation has to happen
-        
+
     def rotate(self):
         time_now = pygame.time.get_ticks()
         if time_now - self.last_update > 50: # in milliseconds
             self.last_update = time_now
-            self.rotation = (self.rotation + self.rotation_speed) % 360 
+            self.rotation = (self.rotation + self.rotation_speed) % 360
             new_image = pygame.transform.rotate(self.image_orig, self.rotation)
             old_center = self.rect.center
             self.image = new_image
@@ -312,7 +377,7 @@ class Pow(pygame.sprite.Sprite):
         if self.rect.top > HEIGHT:
             self.kill()
 
-            
+
 
 ## defines the sprite for bullets
 class Bullet(pygame.sprite.Sprite):
@@ -322,7 +387,7 @@ class Bullet(pygame.sprite.Sprite):
         self.image.set_colorkey(BLACK)
         self.rect = self.image.get_rect()
         ## place the bullet according to the current position of the player
-        self.rect.bottom = y 
+        self.rect.bottom = y
         self.rect.centerx = x
         self.speedy = -10
 
@@ -360,7 +425,7 @@ class Missile(pygame.sprite.Sprite):
 
 background = pygame.image.load(path.join(img_dir, 'starfield.png')).convert()
 background_rect = background.get_rect()
-## ^^ draw this rect first 
+## ^^ draw this rect first
 
 player_img = pygame.image.load(path.join(img_dir, 'playerShip1_orange.png')).convert()
 player_mini_img = pygame.transform.scale(player_img, (25, 19))
@@ -371,8 +436,8 @@ missile_img = pygame.image.load(path.join(img_dir, 'missile.png')).convert_alpha
 meteor_images = []
 meteor_list = [
     'meteorBrown_big1.png',
-    'meteorBrown_big2.png', 
-    'meteorBrown_med1.png', 
+    'meteorBrown_big2.png',
+    'meteorBrown_med1.png',
     'meteorBrown_med3.png',
     'meteorBrown_small1.png',
     'meteorBrown_small2.png',
@@ -427,7 +492,7 @@ player_die_sound = pygame.mixer.Sound(path.join(sound_folder, 'rumble1.ogg'))
 ###################################################
 
 ## TODO: make the game music loop over again and again. play(loops=-1) is not working
-# Error : 
+# Error :
 # TypeError: play() takes no keyword arguments
 #pygame.mixer.music.play()
 
@@ -435,19 +500,37 @@ player_die_sound = pygame.mixer.Sound(path.join(sound_folder, 'rumble1.ogg'))
 ## Game loop
 running = True
 menu_display = True
-while running:
-    if menu_display:
-        main_menu()
-        pygame.time.wait(3000)
 
-        #Stop menu music
-        pygame.mixer.music.stop()
-        #Play the gameplay music
+D = deque()
+
+t_screen = rgb2gray(pygame.surfarray.array3d(screen))
+t_screen = resize(t_screen,(80,80))
+t_screen = rescale_intensity(t_screen, out_range=(0, 255))
+
+stack_screen = np.stack((t_screen, t_screen, t_screen, t_screen), axis=2)
+stack_screen = stack_screen.reshape(1, stack_screen.shape[0], stack_screen.shape[1], stack_screen.shape[2])
+
+OBSERVE = OBSERVATION
+epsilon = INITIAL_EPSILON
+
+t = 0
+
+pkey = PyKeyboard()
+
+while running:
+
+    if menu_display:
+        # main_menu()
+        # pygame.time.wait(3000)
+
+        # Stop menu music
+        # pygame.mixer.music.stop()
+        # Play the gameplay music
         pygame.mixer.music.load(path.join(sound_folder, 'tgfcoder-FrozenJam-SeamlessLoop.ogg'))
         pygame.mixer.music.play(-1)     ## makes the gameplay sound in an endless loop
-        
+
         menu_display = False
-        
+
         ## group all the sprites together for ease of update
         all_sprites = pygame.sprite.Group()
         player = Player()
@@ -467,7 +550,42 @@ while running:
 
         #### Score board variable
         score = 0
-        
+
+    loss = 0
+    Q_sa = 0
+    action_index = 0
+    r_t = 0
+    a_t = np.zeros([ACTIONS])
+    r_t += 0.01
+    score += 0.01
+    terminal = False
+
+    if random.random() <= epsilon:
+        print 'Random Action'
+        action_index = random.randrange(ACTIONS)
+        a_t[action_index] = 1
+    else:
+        q = model.predict(stack_screen)
+        max_Q = np.argmax(q)
+        action_index = max_Q
+        a_t[action_index] = 1
+
+        if epsilon > FINAL_EPSILON and t > OBSERVE:
+            epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / EXPLORE
+
+    if a_t[0] == 1:
+        pkey.press_key('a')
+        pkey.release_key('s')
+    if a_t[1] == 1:
+        pkey.press_key('a')
+    if a_t[2] == 1:
+        pkey.press_key('s')
+    if a_t[3] == 1:
+        pkey.press_key('d')
+    if a_t[4] == 1:
+        pkey.press_key('d')
+        pkey.press_key('s')
+
     #1 Process input/events
     clock.tick(FPS)     ## will make the loop run at the same speed all the time
     for event in pygame.event.get():        # gets all the events which have occured till now and keeps tab of them.
@@ -487,21 +605,21 @@ while running:
     #2 Update
     all_sprites.update()
 
-
     ## check if a bullet hit a mob
     ## now we have a group of bullets and a group of mob
     hits = pygame.sprite.groupcollide(mobs, bullets, True, True)
     ## now as we delete the mob element when we hit one with a bullet, we need to respawn them again
-    ## as there will be no mob_elements left out 
+    ## as there will be no mob_elements left out
     for hit in hits:
-        score += 50 - hit.radius         ## give different scores for hitting big and small metoers
+        score += 1 + hit.radius/100         ## give different scores for hitting big and small metoers
+        r_t += 1 + hit.radius/100
         random.choice(expl_sounds).play()
         # m = Mob()
         # all_sprites.add(m)
         # mobs.add(m)
         expl = Explosion(hit.rect.center, 'lg')
         all_sprites.add(expl)
-        if random.random() > 0.9:
+        if random.random() > 0.95:
             pow = Pow(hit.rect.center)
             all_sprites.add(pow)
             powerups.add(pow)
@@ -517,24 +635,31 @@ while running:
         expl = Explosion(hit.rect.center, 'sm')
         all_sprites.add(expl)
         newmob()
-        if player.shield <= 0: 
+        score -= 0
+        if player.shield <= 0:
             player_die_sound.play()
             death_explosion = Explosion(player.rect.center, 'player')
             all_sprites.add(death_explosion)
             # running = False     ## GAME OVER 3:D
             player.hide()
-            player.lives -= 1
+            player.lives -= 0
             player.shield = 100
+            score -= 0
+            terminal = True
 
     ## if the player hit a power up
     hits = pygame.sprite.spritecollide(player, powerups, True)
     for hit in hits:
         if hit.type == 'shield':
+            score += 0.2
+            r_t += 0.2
             player.shield += random.randrange(10, 30)
             if player.shield >= 100:
                 player.shield = 100
         if hit.type == 'gun':
             player.powerup()
+            score += 0.3
+            r_t += 0.3
 
     ## if player died and the explosion has finished, end game
     if player.lives == 0 and not death_explosion.alive():
@@ -555,6 +680,73 @@ while running:
     draw_lives(screen, WIDTH - 100, 5, player.lives, player_mini_img)
 
     ## Done after drawing everything to the screen
-    pygame.display.flip()       
+    pygame.display.flip()
+
+    if a_t[0] == 1:
+        pkey.release_key('a')
+        pkey.release_key('s')
+    if a_t[1] == 1:
+        pkey.release_key('a')
+    if a_t[2] == 1:
+        pkey.release_key('s')
+    if a_t[3] == 1:
+        pkey.release_key('d')
+    if a_t[4] == 1:
+        pkey.release_key('d')
+        pkey.release_key('s')
+
+    state_screen = stack_screens(screen, stack_screen)
+    D.append((stack_screen, action_index, r_t, state_screen))
+
+    if len(D) > REPLAY_MEMORY:
+        D.popleft()
+
+    if t > OBSERVE:
+        minibatch = random.sample(D, BATCH)
+
+        inputs = np.zeros((BATCH, stack_screen.shape[1], stack_screen.shape[2], stack_screen.shape[3]))
+        targets = np.zeros((inputs.shape[0], ACTIONS))
+
+        for i in range(0, len(minibatch)):
+            state_t = minibatch[i][0]
+            action_t = minibatch[i][1]
+            reward_t = minibatch[i][2]
+            state_t1 = minibatch[i][3]
+            # if terminated, only equals reward
+
+            inputs[i:i + 1] = state_t
+
+            targets[i] = model.predict(state_t)
+            Q_sa = model.predict(state_t1)
+
+            targets[i, action_t] = reward_t + GAMMA * np.max(Q_sa)
+
+        loss += model.train_on_batch(inputs, targets)
+
+    stack_screen = state_screen
+    t += 1
+
+    if t % 1000 == 0:
+        print("Now we save model")
+        model.save_weights("model.h5", overwrite=True)
+        with open("model.json", "w") as outfile:
+            json.dump(model.to_json(), outfile)
+
+    # print info
+    state = ""
+    if t <= OBSERVE:
+        state = "observe"
+    elif t > OBSERVE and t <= OBSERVE + EXPLORE:
+        state = "explore"
+    else:
+        state = "train"
+
+    print("TIMESTEP", t, "/ STATE", state, \
+        "/ EPSILON", epsilon, "/ ACTION", action_index, "/ REWARD", r_t, \
+        "/ Q_MAX " , np.max(Q_sa), "/ Loss ", loss)
+
+    print("Episode finished!")
+    print("************************")
+
 
 pygame.quit()
